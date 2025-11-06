@@ -5,78 +5,74 @@ using UnityEngine;
 using UnityEngine.UI;
 
 /// <summary>
-/// SimpleComboCube_Friendly
-/// - Anexe ao cubo.
-/// - Aceita GameObject para Buffer/Matched (UI Text ou TextMesh).
-/// - Mantém buffer de inputs com timestamps.
-/// - Constrói uma trie (ComboTrie) a partir de combos declarados.
-/// - Usa DFS na trie para encontrar combos alinhados ao final do buffer,
-///   respeitando tempo máximo entre entradas.
-/// - Atualiza BufferText (legível) e MatchedText (nome/descrição), além de criar texto flutuante.
-/// - Nesta versão: prioridade absoluta ao combo mais longo, remoção apenas das entradas usadas,
-///   cooldown e uma pequena janela (extensionWindow) para aguardar possíveis extensões de combos
-///   (evita que um combo curto dispare antes do jogador completar o combo longo).
-/// - Cole em Assets/ISCRIPITIS/SimpleComboCube_Friendly.cs
+/// SimpleComboCube_Friendly (versão final e segura)
+/// ------------------------------------------------------------
+/// - Implementa DFS (Depth First Search) para detecção de combos.
+/// - Usa matriz de adjacência para representar conexões de tokens.
+/// - Protege contra erros de índice e concorrência de coroutines.
+/// - Mantém compatibilidade total com UI (Canvas/TextMesh).
+/// ------------------------------------------------------------
 /// </summary>
 public class SimpleComboCube_Friendly : MonoBehaviour
 {
-    [Header("Arraste os GameObjects de texto (UI Text ou TextMesh)")]
-    public GameObject bufferTextGO;
-    public GameObject matchedTextGO;
+    [Header("Referências de UI")]
+    public GameObject bufferTextGO; // GameObject que exibe o buffer de inputs
+    public GameObject matchedTextGO; // GameObject que exibe o combo detectado
 
-    // componentes detectados
-    private UnityEngine.UI.Text bufferTextUI;
-    private UnityEngine.UI.Text matchedTextUI;
-    private TextMesh bufferTextMesh;
-    private TextMesh matchedTextMesh;
+    private UnityEngine.UI.Text bufferTextUI; // Componente UI Text do buffer
+    private UnityEngine.UI.Text matchedTextUI; // Componente UI Text do combo detectado
+    private TextMesh bufferTextMesh; // Alternativa TextMesh para buffer
+    private TextMesh matchedTextMesh; // Alternativa TextMesh para combo detectado
 
-    [Header("Cube visual")]
-    public Renderer playerRenderer;
-    public Color flashColor = Color.red;
-    public float flashDuration = 0.35f;
+    [Header("Cubo visual")]
+    public Renderer playerRenderer; // Renderer do cubo para efeito de flash
+    public Color flashColor = Color.red; // Cor de flash padrão
+    public float flashDuration = 0.35f; // Duração do flash em segundos
 
     [Header("Floating Text (TextMesh)")]
-    public float floatingTextRise = 0.9f;
-    public float floatingTextLife = 1.0f;
-    public Color floatingTextColor = Color.yellow;
-    public int floatingFontSize = 48;
+    public float floatingTextRise = 0.9f; // Distância que o texto sobe
+    public float floatingTextLife = 1.0f; // Tempo de vida do texto
+    public Color floatingTextColor = Color.yellow; // Cor do texto flutuante
+    public int floatingFontSize = 48; // Tamanho da fonte do texto
 
-    [Header("Config de input")]
-    public float inputRetention = 1.2f;         // tempo máximo para manter inputs no buffer
-    public float maxDeltaBetweenInputs = 0.45f; // janela máxima entre entradas consecutivas
+    [Header("Configuração de input")]
+    [Tooltip("Tempo máximo que um input fica no buffer")]
+    public float inputRetention = 2.0f; // Tempo máximo que um token fica registrado no buffer
 
-    [Header("Combos / comportamento de detecção")]
-    // Evita múltiplos disparos rapidamente
-    private float lastMatchTime = -10f;
-    public float matchCooldown = 0.45f;      // aumentado para reduzir sobreposição (segundos)
-    // Se true, limpa todo o buffer ao detectar um combo (evita sobreposição).
-    // Por padrão deixamos false para remover apenas as entradas usadas — evita remover possíveis prefixes úteis.
-    public bool clearBufferOnMatch = false;
+    [Tooltip("Tempo máximo entre inputs consecutivos de um combo")]
+    public float maxDeltaBetweenInputs = 0.65f; // Intervalo máximo entre dois inputs consecutivos para formar combo
 
-    [Header("Extensão")]
-    [Tooltip("Tempo (s) para aguardar uma possível continuação do combo antes de confirmar um combo mais curto.")]
-    public float extensionWindow = 0.15f;
+    [Header("Detecção e comportamento")]
+    public float matchCooldown = 0.45f; // Cooldown entre detecção de combos
+    public bool clearBufferOnMatch = false; // Limpa todo o buffer após detectar combo
 
-    [Serializable]
-    private struct Timed { public string token; public float time; public Timed(string t, float tm) { token = t; time = tm; } }
+    [Tooltip("Tempo de espera para confirmar se o combo pode ser estendido")]
+    public float extensionWindow = 0.25f; // Janela de extensão para combos
 
-    private readonly List<Timed> buffer = new List<Timed>(); // antigo -> novo
+    private float lastMatchTime = -10f; // Guarda o tempo do último combo detectado
 
-    // ---------- Defina aqui os combos (ids únicos) ----------
-    // Cada combo é (id, sequência de tokens).
+    // Estrutura auxiliar para armazenar inputs e tempos
+    private struct Timed
+    {
+        public string token; // Nome do token
+        public float time; // Timestamp do input
+        public Timed(string t, float tm) { token = t; time = tm; }
+    }
+    private readonly List<Timed> buffer = new List<Timed>(); // Buffer de inputs do jogador
+
+    // Lista de combos declarados
     private readonly List<(string id, string[] seq)> combosList = new List<(string, string[])>
     {
-        ("Ruptura",         new [] { "Right", "LP" }),                 // I J
-        ("Carga Avançada",  new [] { "Down", "Right", "LP" }),         // U I J
-        ("Quebra de Guarda",new [] { "Down", "Right", "HP" }),         // U I K
-        ("Colosso",         new [] { "Down", "Right", "LP", "HP" }),   // U I J K
-        ("Perfuração",      new [] { "Right", "LP", "Right", "HP" }),  // I J I K
-        ("Dobrador",        new [] { "Down", "Down", "Right", "LP" })  // U U I J
+        ("Ruptura",         new [] { "Right", "LP" }),
+        ("Carga Avançada",  new [] { "Down", "Right", "LP" }),
+        ("Quebra de Guarda",new [] { "Down", "Right", "HP" }),
+        ("Colosso",         new [] { "Down", "Right", "LP", "HP" }),
+        ("Perfuração",      new [] { "Right", "LP", "Right", "HP" }),
+        ("Dobrador",        new [] { "Down", "Down", "Right", "LP" })
     };
-    // --------------------------------------------------------
 
-    // Informações amigáveis para exibir
-    private readonly Dictionary<string, (string title, string desc, Color color)> comboInfo = new Dictionary<string, (string,string,Color)>
+    // Informações detalhadas de combos (nome, descrição, cor para UI)
+    private readonly Dictionary<string, (string title, string desc, Color color)> comboInfo = new Dictionary<string, (string, string, Color)>
     {
         { "Ruptura", ("Ruptura", "Pressão rápida — 60 dmg", Color.green) },
         { "Carga Avançada", ("Carga Avançada", "120 dmg", Color.cyan) },
@@ -86,21 +82,19 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         { "Dobrador", ("Dobrador", "Carga dupla — empurrão", new Color(0.2f, 0.7f, 0.2f)) }
     };
 
-    // Trie node
-    private class ComboNode
-    {
-        public Dictionary<string, ComboNode> children = new Dictionary<string, ComboNode>();
-        public bool isEnd = false;
-        public string comboId = null;
-    }
+    // ------------------------------------------------------------
+    // MATRIZ DE ADJACÊNCIA
+    // ------------------------------------------------------------
+    private List<string> tokenList = new List<string> { "Down", "Right", "LP", "HP" }; // Lista de tokens possíveis
+    private bool[,] adjacencyMatrix; // Matriz que indica conexões válidas entre tokens
+    private Dictionary<string, int> tokenIndex; // Mapeia tokens para índices da matriz
 
-    private ComboNode root = new ComboNode();
-    private Color originalColor;
-    private Material instanceMaterial;
+    private Color originalColor; // Cor original do cubo
+    private Material instanceMaterial; // Material instanciado para manipulação segura
 
     void Start()
     {
-        // detecta componentes de texto no GameObject arrastado
+        // Inicializa componentes UI
         if (bufferTextGO != null)
         {
             bufferTextUI = bufferTextGO.GetComponent<UnityEngine.UI.Text>();
@@ -112,42 +106,74 @@ public class SimpleComboCube_Friendly : MonoBehaviour
             if (matchedTextUI == null) matchedTextMesh = matchedTextGO.GetComponent<TextMesh>();
         }
 
-        // instanciar material para alterar cor sem afetar sharedMaterial
+        // Inicializa material do cubo para efeitos visuais
         if (playerRenderer != null)
         {
-            instanceMaterial = new Material(playerRenderer.sharedMaterial);
+            instanceMaterial = new Material(playerRenderer.sharedMaterial); // Cria instância para não modificar material compartilhado
             playerRenderer.material = instanceMaterial;
-            originalColor = instanceMaterial.color;
+            originalColor = instanceMaterial.color; // Armazena cor original
         }
 
-        BuildTrieFromList();
+        BuildAdjacencyMatrix(); // Constroi a matriz de adjacência baseada nos combos
 
-        SetBufferText("Entradas: —");
+        SetBufferText("Entradas: —"); // Inicializa UI
         SetMatchedText("");
     }
 
     void Update()
     {
-        // teclas: U = Down, I = Right, J = LP, K = HP
+        // Captura inputs do jogador
         if (Input.GetKeyDown(KeyCode.U)) AddInput("Down");
         if (Input.GetKeyDown(KeyCode.I)) AddInput("Right");
         if (Input.GetKeyDown(KeyCode.J)) AddInput("LP");
         if (Input.GetKeyDown(KeyCode.K)) AddInput("HP");
 
-        TrimBuffer();
-        UpdateUI();
+        TrimBuffer(); // Remove inputs antigos do buffer
+        UpdateUI(); // Atualiza interface de buffer
 
-        // procura combos alinhados ao final do buffer usando DFS na trie
-        var match = TryMatchComboWithTrie();
-        if (match != null) OnComboMatched(match.Value);
+        var match = TryMatchCombo_DFS(); // Tenta detectar combo
+        if (match != null) OnComboMatched(match.Value); // Se encontrou, processa combo
     }
 
-    // -------- Buffer manipulation --------
+    // ------------------------------------------------------------
+    // MATRIZ DE ADJACÊNCIA
+    // ------------------------------------------------------------
+    private void BuildAdjacencyMatrix()
+    {
+        int n = tokenList.Count;
+        adjacencyMatrix = new bool[n, n]; // Inicializa matriz n x n
+        tokenIndex = new Dictionary<string, int>();
+
+        // Associa cada token a um índice
+        for (int i = 0; i < tokenList.Count; i++)
+            tokenIndex[tokenList[i]] = i;
+
+        // Inicializa matriz com false
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++)
+                adjacencyMatrix[i, j] = false;
+
+        // Preenche matriz com conexões válidas baseadas na lista de combos
+        foreach (var combo in combosList)
+        {
+            var seq = combo.seq;
+            for (int i = 0; i < seq.Length - 1; i++)
+            {
+                int from = tokenIndex[seq[i]];
+                int to = tokenIndex[seq[i + 1]];
+                adjacencyMatrix[from, to] = true; // Conexão válida
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // BUFFER DE INPUTS
+    // ------------------------------------------------------------
     private void AddInput(string token)
     {
-        buffer.Add(new Timed(token, Time.time));
-        TrimBuffer();
-        Debug.Log($"Input: {token} @ {Time.time:F2}");
+        buffer.Add(new Timed(token, Time.time)); // Adiciona input com timestamp
+        Debug.Log($"[INPUT] Token recebido: {token} (t={Time.time:F2})");
+        TrimBuffer(); // Remove inputs antigos para manter buffer limpo
     }
 
     private void TrimBuffer()
@@ -155,160 +181,140 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         float now = Time.time;
         for (int i = 0; i < buffer.Count;)
         {
-            if (now - buffer[i].time > inputRetention) buffer.RemoveAt(i);
+            if (now - buffer[i].time > inputRetention)
+                buffer.RemoveAt(i); // Remove input antigo
             else i++;
         }
     }
 
-    // -------- Trie building --------
-    private void BuildTrieFromList()
-    {
-        root = new ComboNode();
-        foreach (var combo in combosList)
-        {
-            var node = root;
-            foreach (var token in combo.seq)
-            {
-                if (!node.children.TryGetValue(token, out var child))
-                {
-                    child = new ComboNode();
-                    node.children[token] = child;
-                }
-                node = child;
-            }
-            node.isEnd = true;
-            node.comboId = combo.id;
-        }
-    }
-
-    // -------- DFS search aligned to buffer end --------
-    // Retorna (id, length) do melhor match ou null.
-    // Critérios: match termina no final do buffer; entre entradas consecutive <= maxDeltaBetweenInputs.
-    private (string id, int length)? TryMatchComboWithTrie()
+    // ------------------------------------------------------------
+    // DETECÇÃO DE COMBOS COM DFS (versão segura)
+    // ------------------------------------------------------------
+    private (string id, int length)? TryMatchCombo_DFS()
     {
         if (buffer.Count == 0) return null;
-
-        int maxComboLen = GetMaxComboLength();
-        int startMin = Mathf.Max(0, buffer.Count - maxComboLen);
-
         (string id, int length)? best = null;
 
-        for (int start = startMin; start < buffer.Count; start++)
+        // Verifica cada combo declarado na lista
+        foreach (var combo in combosList)
         {
-            DFS_Search(root, start, -1f, 0, ref best, start);
+            if (CheckComboDFS(combo.seq))
+            {
+                if (best == null || combo.seq.Length > best.Value.length)
+                    best = (combo.id, combo.seq.Length); // Escolhe maior combo possível
+            }
         }
 
-        if (best == null) return null;
-
-        // Se o candidato encontrado pode ser estendido (há filhos na trie a partir do nó final desse candidato),
-        // aguardamos a extensionWindow após o último input antes de confirmar o combo curto.
-        // Isso evita disparar um combo curto quando o jogador está prestes a apertar a próxima tecla para formar um combo longo.
-        float lastInputTime = buffer[buffer.Count - 1].time;
-        // encontra o nó correspondente ao best.id seguindo a sequência (do último comprimento)
-        var endNode = FindNodeForMatch(best.Value.id, best.Value.length);
-        if (endNode != null && endNode.children.Count > 0)
+        // Se um combo foi encontrado, aguarda janela de extensão
+        if (best != null && best.Value.length < MaxComboLength())
         {
-            // existe possibilidade de extensão; se a última entrada foi recente, aguarde
-            if (Time.time - lastInputTime < extensionWindow)
-            {
-                return null; // adia a confirmação para próxima frame/entrada
-            }
+            StopCoroutine(nameof(ConfirmComboWithDelay)); // Cancela coroutine antiga
+            StartCoroutine(ConfirmComboWithDelay(best.Value)); // Inicia confirmação segura
+            return null;
         }
 
         return best;
     }
 
-    // encontra o nó que corresponde ao match final (navega desde a raiz seguindo os últimos 'length' tokens do buffer)
-    private ComboNode FindNodeForMatch(string comboId, int length)
+    // ------------------------------------------------------------
+    // Coroutine segura com verificação de buffer
+    // ------------------------------------------------------------
+    private IEnumerator ConfirmComboWithDelay((string id, int length) combo)
     {
-        // percorre os últimos 'length' tokens do buffer e anda na trie
-        int startIndex = buffer.Count - length;
-        if (startIndex < 0) return null;
-        var node = root;
-        for (int i = startIndex; i < buffer.Count; i++)
+        float wait = extensionWindow;
+        yield return new WaitForSeconds(wait); // Espera janela de extensão
+
+        // Verifica se buffer ainda existe e contém elementos
+        if (buffer == null || buffer.Count == 0)
+            yield break;
+
+        float lastInputTime = buffer[buffer.Count - 1].time;
+
+        // Só confirma se não houve novos inputs durante a espera
+        if (Time.time - lastInputTime >= wait)
         {
-            var token = buffer[i].token;
-            if (!node.children.TryGetValue(token, out var child)) return null;
-            node = child;
-        }
-        // valida se o nó realmente representa comboId
-        if (node.isEnd && node.comboId == comboId) return node;
-        return null;
-    }
-
-    // DFS_Search explores trie following buffer tokens from position 'pos' forward.
-    // We keep track of lastTime (time of previous consumed token) to enforce maxDeltaBetweenInputs.
-    private void DFS_Search(ComboNode node, int pos, float lastTime, int consumed, ref (string id, int length)? best, int startPos)
-    {
-        if (pos >= buffer.Count) return;
-
-        string token = buffer[pos].token;
-
-        if (node.children.TryGetValue(token, out var child))
-        {
-            float currentTime = buffer[pos].time;
-            if (consumed == 0 || lastTime < 0f || (currentTime - lastTime) <= maxDeltaBetweenInputs)
-            {
-                int newConsumed = consumed + 1;
-                if (child.isEnd && pos == buffer.Count - 1)
-                {
-                    var candidate = (id: child.comboId, length: newConsumed);
-                    // preferimos sempre o mais longo; se empate, mantém o primeiro encontrado
-                    if (best == null || candidate.length > best.Value.length) best = candidate;
-                }
-                DFS_Search(child, pos + 1, currentTime, newConsumed, ref best, startPos);
-            }
+            Debug.Log($"[CONFIRMAÇÃO] Combo '{combo.id}' confirmado após {wait:F2}s de extensão.");
+            OnComboMatched(combo);
         }
     }
 
-    private int GetMaxComboLength()
+    private int MaxComboLength()
     {
         int max = 0;
-        foreach (var c in combosList) if (c.seq.Length > max) max = c.seq.Length;
+        foreach (var c in combosList)
+            if (c.seq.Length > max) max = c.seq.Length;
         return max;
     }
 
-    // -------- On match --------
-    private void OnComboMatched((string id, int length) match)
+    private bool CheckComboDFS(string[] comboSeq)
     {
-        // cooldown global para evitar múltiplos disparos
-        if (Time.time - lastMatchTime < matchCooldown) return;
-        lastMatchTime = Time.time;
+        if (buffer.Count < comboSeq.Length) return false;
 
-        Debug.Log($"Combo matched: {match.id}");
+        int startIndex = buffer.Count - comboSeq.Length;
 
-        // mostrar informação amigável no MatchedText
-        ShowComboFriendly(match.id);
-
-        // flash do cubo
-        if (playerRenderer != null && instanceMaterial != null)
+        for (int i = 0; i < comboSeq.Length; i++)
         {
-            CancelInvoke(nameof(ResetCubeColor));
-            instanceMaterial.color = comboInfo.ContainsKey(match.id) ? comboInfo[match.id].color : flashColor;
-            Invoke(nameof(ResetCubeColor), flashDuration);
+            string current = buffer[startIndex + i].token;
+            if (current != comboSeq[i]) return false;
+
+            if (i > 0)
+            {
+                float delta = buffer[startIndex + i].time - buffer[startIndex + i - 1].time;
+                if (delta > maxDeltaBetweenInputs) return false; // Input muito lento
+
+                int prevIndex = tokenIndex[comboSeq[i - 1]];
+                int currIndex = tokenIndex[comboSeq[i]];
+                if (!adjacencyMatrix[prevIndex, currIndex]) return false; // Conexão inválida
+            }
         }
 
-        // spawn floating text (apenas ID curto)
-        StartCoroutine(SpawnFloatingText(match.id + "!"));
+        return true; // Combo válido
+    }
 
-        // remover apenas as entradas usadas (do final) — não limpar o buffer inteiro por padrão
-        int removeCount = match.length;
-        for (int i = 0; i < removeCount && buffer.Count >= removeCount; i++)
-            buffer.RemoveAt(buffer.Count - removeCount);
+    // ------------------------------------------------------------
+    // COMBO DETECTADO / UI / VISUAL
+    // ------------------------------------------------------------
+    private void OnComboMatched((string id, int length) match)
+    {
+        if (Time.time - lastMatchTime < matchCooldown) return; // Evita spam de combos
+        lastMatchTime = Time.time;
 
-        // opcional: limpar todo o buffer para evitar sobreposição (se o usuário explicitamente ativar)
-        if (clearBufferOnMatch) buffer.Clear();
+        Debug.Log($"[COMBO DETECTADO] {match.id} (t={Time.time:F2})");
+
+        ShowComboFriendly(match.id); // Atualiza UI com combo
+
+        if (playerRenderer != null && instanceMaterial != null)
+        {
+            CancelInvoke(nameof(ResetCubeColor)); // Cancela qualquer reset pendente
+            instanceMaterial.color = comboInfo.ContainsKey(match.id) ? comboInfo[match.id].color : flashColor;
+            Invoke(nameof(ResetCubeColor), flashDuration); // Reseta cor após flash
+        }
+
+        StartCoroutine(SpawnFloatingText(match.id + "!")); // Mostra texto flutuante
+
+        // Remove tokens usados do buffer
+        for (int i = 0; i < match.length && buffer.Count > 0; i++)
+            buffer.RemoveAt(buffer.Count - 1);
+
+        if (clearBufferOnMatch) buffer.Clear(); // Limpa buffer inteiro se configurado
     }
 
     private void ResetCubeColor()
     {
-        if (instanceMaterial != null) instanceMaterial.color = originalColor;
+        if (instanceMaterial != null) instanceMaterial.color = originalColor; // Restaura cor original
     }
 
-    // -------- UI helpers --------
     private void UpdateUI()
     {
-        SetBufferText(BufferToFriendlyString());
+        SetBufferText(BufferToString()); // Atualiza UI do buffer
+    }
+
+    private string BufferToString()
+    {
+        if (buffer.Count == 0) return "Entradas: —";
+        List<string> tokens = new List<string>();
+        foreach (var b in buffer) tokens.Add(b.token);
+        return "Entradas: " + string.Join(" → ", tokens);
     }
 
     private void SetBufferText(string s)
@@ -323,20 +329,6 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         else if (matchedTextMesh != null) matchedTextMesh.text = s;
     }
 
-    private string BufferToFriendlyString()
-    {
-        var tokens = GetTokenListFromBuffer();
-        if (tokens.Count == 0) return "Entradas: —";
-        return "Entradas: " + string.Join(" → ", tokens);
-    }
-
-    private List<string> GetTokenListFromBuffer()
-    {
-        var list = new List<string>();
-        for (int i = 0; i < buffer.Count; i++) list.Add(buffer[i].token);
-        return list;
-    }
-
     private void ShowComboFriendly(string comboId)
     {
         if (comboInfo.TryGetValue(comboId, out var info))
@@ -349,8 +341,9 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         {
             SetMatchedText($"Combo: {comboId}");
         }
-        CancelInvoke(nameof(ClearMatchedText));
-        Invoke(nameof(ClearMatchedText), 0.9f);
+
+        CancelInvoke(nameof(ClearMatchedText)); // Cancela limpeza anterior
+        Invoke(nameof(ClearMatchedText), 0.9f); // Limpa texto após tempo
     }
 
     private void ClearMatchedText()
@@ -358,20 +351,19 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         SetMatchedText("");
     }
 
-    // -------- Floating Text (TextMesh runtime) --------
     private IEnumerator SpawnFloatingText(string text)
     {
-        GameObject go = new GameObject("FloatingText");
-        go.transform.position = transform.position + Vector3.up * 1.2f;
-        if (Camera.main) go.transform.rotation = Camera.main.transform.rotation;
+        GameObject go = new GameObject("FloatingText"); // Cria objeto do texto flutuante
+        go.transform.position = transform.position + Vector3.up * 1.2f; // Posiciona acima do cubo
+        if (Camera.main) go.transform.rotation = Camera.main.transform.rotation; // Alinha com câmera
 
-        var tm = go.AddComponent<TextMesh>();
+        var tm = go.AddComponent<TextMesh>(); // Adiciona TextMesh
         tm.text = text;
         tm.fontSize = floatingFontSize;
         tm.anchor = TextAnchor.MiddleCenter;
         tm.alignment = TextAlignment.Center;
         tm.color = floatingTextColor;
-        go.transform.localScale = Vector3.one * 0.02f;
+        go.transform.localScale = Vector3.one * 0.02f; // Escala adequada
 
         float t = 0f;
         Vector3 startPos = go.transform.position;
@@ -379,11 +371,11 @@ public class SimpleComboCube_Friendly : MonoBehaviour
         {
             t += Time.deltaTime;
             float norm = t / floatingTextLife;
-            go.transform.position = startPos + Vector3.up * (floatingTextRise * norm);
-            Color c = tm.color; c.a = Mathf.Lerp(1f, 0f, norm); tm.color = c;
-            if (Camera.main) go.transform.rotation = Camera.main.transform.rotation;
+            go.transform.position = startPos + Vector3.up * (floatingTextRise * norm); // Move texto para cima
+            Color c = tm.color; c.a = Mathf.Lerp(1f, 0f, norm); tm.color = c; // Fade out
+            if (Camera.main) go.transform.rotation = Camera.main.transform.rotation; // Mantém alinhamento com câmera
             yield return null;
         }
-        Destroy(go);
+        Destroy(go); // Destroi objeto ao final
     }
 }
